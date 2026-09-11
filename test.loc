@@ -1,0 +1,4 @@
+module test-parallel-cpp (test)
+
+import parallel.test (test)
+import parallel-cpp

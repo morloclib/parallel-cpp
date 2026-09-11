@@ -1,0 +1,20 @@
+--' C++ implementations of the `parallel` module.
+--'
+--' Workers are threads pulling from a shared cursor, so a shrinking schedule
+--' is genuinely dynamic rather than merely uneven. Every worker body catches:
+--' an exception escaping a std::thread calls std::terminate, which would take
+--' the pool down and report a crash where the user's error belongs.
+module parallel-cpp (*)
+
+import parallel
+import root-cpp
+
+record Cpp => ParOpts = "ParOpts"
+data Cpp => ParChunking = "ParChunking"
+data Cpp => ParOrder = "ParOrder"
+
+source Cpp from "parallel.hpp"
+  ( "pmapWith"
+  , "pfilterWith"
+  , "pconcatMapWith"
+  )
