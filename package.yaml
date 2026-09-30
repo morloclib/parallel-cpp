@@ -1,5 +1,5 @@
 name: parallel-cpp
-version: 0.2.0
+version: 0.3.0
 homepage: https://github.com/morloclib/parallel-cpp
 synopsis: C++ (std::thread) implementations for the parallel module
 description: Thread-pool implementations of the parallel combinators.
