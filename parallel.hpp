@@ -2,6 +2,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <memory>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -90,16 +94,18 @@ inline void run_spans(const ParOpts& opts, std::size_t nspans, Body body) {
 
     const std::size_t nthreads = std::min(std::max<std::size_t>(1, worker_count(opts)), nspans);
     std::atomic<std::size_t> cursor{0};
+    std::atomic<bool> stop{false};
     std::exception_ptr first;
     std::mutex first_mtx;
 
     auto worker = [&]() {
-        for (;;) {
+        while (!stop.load(std::memory_order_relaxed)) {
             const std::size_t i = cursor.fetch_add(1, std::memory_order_relaxed);
             if (i >= nspans) return;
             try {
                 body(i);
             } catch (...) {
+                stop.store(true, std::memory_order_relaxed);
                 std::lock_guard<std::mutex> lk(first_mtx);
                 if (!first) first = std::current_exception();
                 return;
@@ -107,9 +113,17 @@ inline void run_spans(const ParOpts& opts, std::size_t nspans, Body body) {
         }
     };
 
+    // A joinable std::thread destroyed during unwinding calls std::terminate,
+    // so a failure to start a thread must still join the ones already running.
     std::vector<std::thread> threads;
     threads.reserve(nthreads - 1);
-    for (std::size_t t = 0; t + 1 < nthreads; ++t) threads.emplace_back(worker);
+    try {
+        for (std::size_t t = 0; t + 1 < nthreads; ++t) threads.emplace_back(worker);
+    } catch (...) {
+        stop.store(true, std::memory_order_relaxed);
+        for (auto& t : threads) t.join();
+        throw;
+    }
     worker();
     for (auto& t : threads) t.join();
     if (first) std::rethrow_exception(first);
@@ -177,4 +191,289 @@ inline std::vector<A> pfilterWith(const ParOpts& opts, P pred, const std::vector
         if (keep[j]) out.push_back(xs[j]);
     }
     return out;
+}
+
+// Streams
+// -------
+//
+// A stream stage is a pipeline. The calling thread pulls batches and sinks
+// results -- the source and sink are morloc closures bound to this thread's
+// call -- while a set of worker threads started once per stage maps work
+// units. `inflight` counts units dispatched and not yet delivered, so it bounds
+// the reorder buffer as well as the queue.
+//
+// Every exit path, including an exception from the pull, the sink or a
+// combine, stops and joins the workers before leaving: a joinable std::thread
+// destroyed during unwinding calls std::terminate.
+
+namespace mlcpar {
+
+inline std::size_t inflight_limit(const ParOpts& opts, std::size_t w) {
+    return std::max<std::size_t>(1, positive_or(opts.inflight, 2 * w));
+}
+
+template <class A, class Out>
+class StreamWorkers {
+public:
+    struct Unit {
+        std::size_t seq;
+        std::shared_ptr<const std::vector<A>> batch;
+        std::size_t lo;
+        std::size_t hi;
+    };
+    struct Done {
+        std::size_t seq;
+        Out out;
+        std::exception_ptr error;
+    };
+
+    template <class Compute>
+    StreamWorkers(std::size_t n, Compute compute) {
+        threads_.reserve(n);
+        try {
+            for (std::size_t t = 0; t < n; ++t) {
+                threads_.emplace_back([this, compute]() { run(compute); });
+            }
+        } catch (...) {
+            shutdown();
+            throw;
+        }
+    }
+
+    ~StreamWorkers() { shutdown(); }
+
+    void submit(Unit u) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            work_.push_back(std::move(u));
+        }
+        work_cv_.notify_one();
+    }
+
+    // Block until at least one unit has completed, and take every completed one.
+    std::vector<Done> wait_done() {
+        std::unique_lock<std::mutex> lk(mtx_);
+        done_cv_.wait(lk, [this] { return !done_.empty(); });
+        std::vector<Done> out;
+        out.swap(done_);
+        return out;
+    }
+
+    // Queued units not yet started are skipped once this is set.
+    void abandon() { stop_.store(true, std::memory_order_relaxed); }
+
+    void shutdown() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            closing_ = true;
+        }
+        stop_.store(true, std::memory_order_relaxed);
+        work_cv_.notify_all();
+        for (auto& t : threads_) {
+            if (t.joinable()) t.join();
+        }
+    }
+
+private:
+    template <class Compute>
+    void run(Compute compute) {
+        for (;;) {
+            Unit u;
+            {
+                std::unique_lock<std::mutex> lk(mtx_);
+                work_cv_.wait(lk, [this] { return closing_ || !work_.empty(); });
+                if (work_.empty()) return;
+                u = std::move(work_.front());
+                work_.pop_front();
+            }
+            Done d{u.seq, Out{}, nullptr};
+            if (!stop_.load(std::memory_order_relaxed)) {
+                try {
+                    d.out = compute(*u.batch, u.lo, u.hi);
+                } catch (...) {
+                    d.error = std::current_exception();
+                }
+            }
+            {
+                std::lock_guard<std::mutex> lk(mtx_);
+                done_.push_back(std::move(d));
+            }
+            done_cv_.notify_one();
+        }
+    }
+
+    std::vector<std::thread> threads_;
+    std::mutex mtx_;
+    std::condition_variable work_cv_;
+    std::condition_variable done_cv_;
+    std::deque<Unit> work_;
+    std::vector<Done> done_;
+    bool closing_ = false;
+    std::atomic<bool> stop_{false};
+};
+
+// Run a stream stage. `compute(batch, lo, hi)` maps one unit; `deliver`
+// receives each non-empty unit result, in input order when `ordered`.
+// Returns {true, ""} at end of stream or {false, msg} after a read failure,
+// once every dispatched unit has been delivered. A failure in a unit or in
+// `deliver` propagates.
+template <class A, class Out, class Pull, class Compute, class Deliver>
+std::tuple<bool, std::string> pipeline(const ParOpts& opts, Pull& pull, Compute compute,
+                                       Deliver deliver, bool ordered) {
+    const std::size_t w = worker_count(opts);
+
+    if (w <= 1) {
+        for (;;) {
+            auto [ok, msg, xs] = pull();
+            if (!ok) return {false, msg};
+            if (xs.empty()) return {true, std::string()};
+            for (const auto& [lo, hi] : ranges(xs.size(), opts)) {
+                Out ys = compute(xs, lo, hi);
+                if (!ys.empty()) deliver(std::move(ys));
+            }
+        }
+    }
+
+    using Workers = StreamWorkers<A, Out>;
+    Workers workers(w, compute);
+    const std::size_t limit = inflight_limit(opts, w);
+
+    std::shared_ptr<const std::vector<A>> batch;
+    std::vector<Span> spans;
+    std::size_t span_i = 0;
+    bool reading = true;
+    std::tuple<bool, std::string> status{true, std::string()};
+    std::exception_ptr failure;
+    std::size_t next_seq = 0, next_out = 0, running = 0, undelivered = 0;
+    std::map<std::size_t, Out> held;
+
+    for (;;) {
+        while (reading && !failure && undelivered < limit) {
+            if (span_i == spans.size()) {
+                auto [ok, msg, xs] = pull();
+                if (!ok) {
+                    reading = false;
+                    status = {false, msg};
+                    break;
+                }
+                if (xs.empty()) {
+                    reading = false;
+                    break;
+                }
+                batch = std::make_shared<const std::vector<A>>(std::move(xs));
+                spans = ranges(batch->size(), opts);
+                span_i = 0;
+            }
+            const auto [lo, hi] = spans[span_i++];
+            workers.submit({next_seq++, batch, lo, hi});
+            ++running;
+            ++undelivered;
+        }
+
+        if (running == 0) break;
+
+        for (auto& d : workers.wait_done()) {
+            --running;
+            if (d.error) {
+                if (!failure) failure = d.error;
+                workers.abandon();
+                continue;
+            }
+            if (failure) continue;
+            if (ordered) {
+                held.emplace(d.seq, std::move(d.out));
+                for (auto it = held.find(next_out); it != held.end(); it = held.find(next_out)) {
+                    Out ys = std::move(it->second);
+                    held.erase(it);
+                    ++next_out;
+                    --undelivered;
+                    if (!ys.empty()) deliver(std::move(ys));
+                }
+            } else {
+                --undelivered;
+                if (!d.out.empty()) deliver(std::move(d.out));
+            }
+        }
+    }
+
+    workers.shutdown();
+    if (failure) std::rethrow_exception(failure);
+    return status;
+}
+
+template <class Pull>
+using pulled_batch_t = std::decay_t<decltype(std::get<2>(std::declval<Pull&>()()))>;
+
+}  // namespace mlcpar
+
+template <class F, class Pull, class Sink>
+std::tuple<bool, std::string> psconcatMapNative(const ParOpts& opts, F f, Pull pull, Sink sink) {
+    using Batch = mlcpar::pulled_batch_t<Pull>;
+    using A = typename Batch::value_type;
+    using Out = std::decay_t<std::invoke_result_t<F, const A&>>;
+    auto compute = [f](const std::vector<A>& xs, std::size_t lo, std::size_t hi) {
+        Out out;
+        for (std::size_t j = lo; j < hi; ++j) {
+            Out piece = f(xs[j]);
+            out.insert(out.end(), std::make_move_iterator(piece.begin()),
+                       std::make_move_iterator(piece.end()));
+        }
+        return out;
+    };
+    auto deliver = [&sink](Out ys) { sink(ys); };
+    return mlcpar::pipeline<A, Out>(opts, pull, compute, deliver, opts.order == ParOrder::InputOrder);
+}
+
+template <class F, class Pull, class Sink>
+std::tuple<bool, std::string> psmapNative(const ParOpts& opts, F f, Pull pull, Sink sink) {
+    using Batch = mlcpar::pulled_batch_t<Pull>;
+    using A = typename Batch::value_type;
+    using Out = std::vector<std::decay_t<std::invoke_result_t<F, const A&>>>;
+    auto compute = [f](const std::vector<A>& xs, std::size_t lo, std::size_t hi) {
+        Out out;
+        out.reserve(hi - lo);
+        for (std::size_t j = lo; j < hi; ++j) out.emplace_back(f(xs[j]));
+        return out;
+    };
+    auto deliver = [&sink](Out ys) { sink(ys); };
+    return mlcpar::pipeline<A, Out>(opts, pull, compute, deliver, opts.order == ParOrder::InputOrder);
+}
+
+template <class P, class Pull, class Sink>
+std::tuple<bool, std::string> psfilterNative(const ParOpts& opts, P pred, Pull pull, Sink sink) {
+    using Batch = mlcpar::pulled_batch_t<Pull>;
+    using A = typename Batch::value_type;
+    using Out = std::vector<A>;
+    auto compute = [pred](const std::vector<A>& xs, std::size_t lo, std::size_t hi) {
+        Out out;
+        for (std::size_t j = lo; j < hi; ++j) {
+            if (pred(xs[j])) out.push_back(xs[j]);
+        }
+        return out;
+    };
+    auto deliver = [&sink](Out ys) { sink(ys); };
+    return mlcpar::pipeline<A, Out>(opts, pull, compute, deliver, opts.order == ParOrder::InputOrder);
+}
+
+// The fold always consumes results in input order, whatever `order` asks: a
+// fixed fold order is what makes the answer schedule-independent.
+template <class C, class Acc, class F, class Pull>
+std::tuple<bool, std::string, Acc> psfoldNative(const ParOpts& opts, C combine, Acc identity, F f,
+                                                 Pull pull) {
+    using Batch = mlcpar::pulled_batch_t<Pull>;
+    using A = typename Batch::value_type;
+    using B = std::decay_t<std::invoke_result_t<F, const A&>>;
+    using Out = std::vector<B>;
+    auto compute = [f](const std::vector<A>& xs, std::size_t lo, std::size_t hi) {
+        Out out;
+        out.reserve(hi - lo);
+        for (std::size_t j = lo; j < hi; ++j) out.emplace_back(f(xs[j]));
+        return out;
+    };
+    Acc acc = std::move(identity);
+    auto deliver = [&](Out ys) {
+        for (auto& y : ys) acc = combine(acc, y);
+    };
+    auto [ok, msg] = mlcpar::pipeline<A, Out>(opts, pull, compute, deliver, true);
+    return {ok, msg, std::move(acc)};
 }

@@ -1,4 +1,7 @@
 module test-parallel-cpp (test)
 
-import parallel.test (test)
+import parallel.test (test, synthOpen, synthNext, sinkOpen, sinkPut, sinkBatches)
 import parallel-cpp
+import text-py
+
+source Cpp from "testlib.hpp" ("synthOpen", "synthNext", "sinkOpen", "sinkPut", "sinkBatches")

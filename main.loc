@@ -17,4 +17,8 @@ source Cpp from "parallel.hpp"
   ( "pmapWith"
   , "pfilterWith"
   , "pconcatMapWith"
+  , "psconcatMapNative"
+  , "psmapNative"
+  , "psfilterNative"
+  , "psfoldNative"
   )

@@ -1,4 +1,9 @@
 test-build
 test
 bench
-bench-build
+*-build*
+bench-cross
+bench-cross-build
+*.log
+*.dat
+__pycache__/

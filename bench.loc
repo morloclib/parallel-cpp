@@ -1,0 +1,6 @@
+module bench-parallel-cpp (seqMap, parMap, seqFilter, parFilter, seqConcatMap, parConcatMap, seqPayload, parPayload, streamMake, streamNative, streamPure, streamFoldNative, streamFoldPure)
+
+import parallel.bench
+import parallel-cpp
+
+source Cpp from "benchcosts.hpp" ("spin", "spinKeep", "spinList", "makeStr", "strCost")
