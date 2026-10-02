@@ -16,6 +16,10 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <functional>
+#include <stdexcept>
+#include <pthread.h>
+#include <sys/resource.h>
 
 // User-mapped types, matching the declarations in parallel/main.loc. Field and
 // tag order are the wire contract: a record is positional and a constructor's
@@ -34,6 +38,58 @@ struct ParOpts {
 namespace mlcpar {
 
 using Span = std::pair<std::size_t, std::size_t>;
+
+// A worker thread with the same stack on every platform. std::thread takes
+// the platform default for a secondary thread: the stack rlimit (8 MiB) on
+// Linux but 512 KiB on macOS, so a mapped function recursing deeply enough
+// passes on Linux and overflows only on macOS. This uses the stack rlimit,
+// or 8 MiB when it is unlimited or unknown, everywhere.
+class Thread {
+  public:
+    template <class F>
+    explicit Thread(F f) {
+        auto* body = new std::function<void()>(std::move(f));
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, stack_size());
+        int rc = pthread_create(&tid_, &attr, &Thread::start, body);
+        pthread_attr_destroy(&attr);
+        if (rc != 0) {
+            delete body;
+            throw std::runtime_error("cannot start a worker thread");
+        }
+        joinable_ = true;
+    }
+    Thread(Thread&& o) noexcept : tid_(o.tid_), joinable_(o.joinable_) { o.joinable_ = false; }
+    Thread(const Thread&) = delete;
+    Thread& operator=(const Thread&) = delete;
+    ~Thread() { join(); }
+
+    bool joinable() const { return joinable_; }
+    void join() {
+        if (joinable_) {
+            pthread_join(tid_, nullptr);
+            joinable_ = false;
+        }
+    }
+
+  private:
+    static void* start(void* arg) {
+        std::unique_ptr<std::function<void()>> body(static_cast<std::function<void()>*>(arg));
+        (*body)();
+        return nullptr;
+    }
+    static std::size_t stack_size() {
+        const std::size_t fallback = std::size_t(8) << 20;
+        struct rlimit rl;
+        if (getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur >= (1u << 20)) {
+            return static_cast<std::size_t>(rl.rlim_cur);
+        }
+        return fallback;
+    }
+    pthread_t tid_{};
+    bool joinable_ = false;
+};
 
 inline std::size_t positive_or(const std::optional<int>& v, std::size_t fallback) {
     if (v.has_value() && *v > 0) return static_cast<std::size_t>(*v);
@@ -83,7 +139,7 @@ inline std::vector<Span> ranges(std::size_t n, const ParOpts& opts) {
 // shared cursor -- which is what makes a shrinking schedule dynamic rather
 // than merely uneven.
 //
-// Every worker body is wrapped: an exception escaping a std::thread's function
+// Every worker body is wrapped: an exception escaping a thread's function
 // calls std::terminate, which would take the whole pool down and report a
 // crash instead of the user's error. The first failure is rethrown on the
 // calling thread once the workers have joined.
@@ -113,9 +169,9 @@ inline void run_spans(const ParOpts& opts, std::size_t nspans, Body body) {
         }
     };
 
-    // A joinable std::thread destroyed during unwinding calls std::terminate,
-    // so a failure to start a thread must still join the ones already running.
-    std::vector<std::thread> threads;
+    // A failure to start a thread stops the ones already running before it
+    // propagates; joining them unstopped would wait for all the work.
+    std::vector<Thread> threads;
     threads.reserve(nthreads - 1);
     try {
         for (std::size_t t = 0; t + 1 < nthreads; ++t) threads.emplace_back(worker);
@@ -203,8 +259,8 @@ inline std::vector<A> pfilterWith(const ParOpts& opts, P pred, const std::vector
 // the reorder buffer as well as the queue.
 //
 // Every exit path, including an exception from the pull, the sink or a
-// combine, stops and joins the workers before leaving: a joinable std::thread
-// destroyed during unwinding calls std::terminate.
+// combine, stops and joins the workers before leaving: a worker left running
+// would read data the caller has already released.
 
 namespace mlcpar {
 
@@ -302,7 +358,7 @@ private:
         }
     }
 
-    std::vector<std::thread> threads_;
+    std::vector<Thread> threads_;
     std::mutex mtx_;
     std::condition_variable work_cv_;
     std::condition_variable done_cv_;
